@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CCC Manager Node - HTTP server that coordinates task dispatch,
+  worker registration, and status tracking for Claude Code pods.
+
+Parameters:
+  ManagerName:
+    Type: String
+    Description: Human-readable name for this manager node
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    ConstraintDescription: Alphanumeric and hyphens only
+
+  ManagerTier:
+    Type: String
+    AllowedValues:
+      - t1
+      - t2
+      - t3
+    Description: Manager tier (t1=primary, t2=secondary, t3=tertiary)
+
+  ParentURL:
+    Type: String
+    Description: URL of the parent manager (empty for top-level)
+    Default: ''
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type
+
+  SpotMaxPrice:
+    Type: String
+    Default: '0.02'
+    Description: Maximum spot price in USD
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+  DockerImage:
+    Type: String
+    Description: ECR image URI for the manager container
+
+Mappings:
+  RegionAMI:
+    us-east-2:
+      AMI: ami-0cb91c7de36eed2cb
+
+Resources:
+  ManagerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: !Ref SpotMaxPrice
+
+  ManagerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ManagerLaunchTemplate
+        Version: !GetAtt ManagerLaunchTemplate.LatestVersionNumber
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !ImportValue hackathon26-sg-internal
+        - !ImportValue hackathon26-sg-worker
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'ccc-manager-${ManagerName}'
+        - Key: Project
+          Value: hackathon26
+        - Key: Role
+          Value: manager
+        - Key: Tier
+          Value: !Ref ManagerTier
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/user-data.log 2>&1
+
+          # System updates
+          yum update -y
+          yum install -y jq unzip
+
+          # Install Docker
+          amazon-linux-extras install docker -y
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+
+          # Install AWS CLI v2
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+
+          # ECR login and pull golden image
+          REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+          docker pull ${DockerImage}
+
+          # Write manager daemon
+          cat > /opt/manager-daemon.py << 'DAEMON_EOF'
+          #!/usr/bin/env python3
+          """CCC Manager Daemon - task dispatch and worker coordination."""
+
+          import json
+          import threading
+          import uuid
+          from datetime import datetime, timezone
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+
+          tasks = {}
+          workers = {}
+          lock = threading.Lock()
+
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          class ManagerHandler(BaseHTTPRequestHandler):
+              def _send_json(self, code, data):
+                  body = json.dumps(data).encode()
+                  self.send_response(code)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _read_body(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  return json.loads(self.rfile.read(length)) if length else {}
+
+              def do_GET(self):
+                  if self.path == '/health':
+                      self._send_json(200, {
+                          'status': 'healthy',
+                          'manager': '${ManagerName}',
+                          'tier': '${ManagerTier}',
+                          'timestamp': now_iso()
+                      })
+                  elif self.path == '/api/status':
+                      with lock:
+                          self._send_json(200, {
+                              'manager': '${ManagerName}',
+                              'tier': '${ManagerTier}',
+                              'parent_url': '${ParentURL}',
+                              'tasks': {tid: t for tid, t in tasks.items()},
+                              'workers': {wid: w for wid, w in workers.items()},
+                              'timestamp': now_iso()
+                          })
+                  else:
+                      self._send_json(404, {'error': 'not found'})
+
+              def do_POST(self):
+                  if self.path == '/api/submit':
+                      body = self._read_body()
+                      tid = str(uuid.uuid4())[:8]
+                      with lock:
+                          tasks[tid] = {
+                              'id': tid,
+                              'title': body.get('title', ''),
+                              'description': body.get('description', ''),
+                              'status': 'pending',
+                              'assigned_worker': None,
+                              'submitted_at': now_iso(),
+                              'completed_at': None
+                          }
+                      self._send_json(201, tasks[tid])
+
+                  elif self.path == '/api/register':
+                      body = self._read_body()
+                      wid = body.get('worker_id', str(uuid.uuid4())[:8])
+                      with lock:
+                          workers[wid] = {
+                              'worker_id': wid,
+                              'ip': body.get('ip', ''),
+                              'capabilities': body.get('capabilities', []),
+                              'status': 'idle',
+                              'registered_at': now_iso(),
+                              'last_heartbeat': now_iso()
+                          }
+                      self._send_json(201, workers[wid])
+
+                  elif self.path == '/api/task-complete':
+                      body = self._read_body()
+                      tid = body.get('task_id', '')
+                      with lock:
+                          if tid in tasks:
+                              tasks[tid]['status'] = 'completed'
+                              tasks[tid]['completed_at'] = now_iso()
+                              tasks[tid]['result'] = body.get('result', '')
+                              wid = tasks[tid].get('assigned_worker')
+                              if wid and wid in workers:
+                                  workers[wid]['status'] = 'idle'
+                              self._send_json(200, tasks[tid])
+                          else:
+                              self._send_json(404, {'error': f'task {tid} not found'})
+
+                  elif self.path == '/api/blocker':
+                      body = self._read_body()
+                      tid = body.get('task_id', '')
+                      with lock:
+                          if tid in tasks:
+                              tasks[tid]['status'] = 'blocked'
+                              tasks[tid]['blocker'] = body.get('reason', '')
+                              self._send_json(200, tasks[tid])
+                          else:
+                              self._send_json(404, {'error': f'task {tid} not found'})
+                  else:
+                      self._send_json(404, {'error': 'not found'})
+
+              def log_message(self, format, *args):
+                  pass  # Suppress default logging
+
+
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 8080), ManagerHandler)
+              print(f'Manager daemon listening on port 8080')
+              server.serve_forever()
+          DAEMON_EOF
+          chmod +x /opt/manager-daemon.py
+
+          # Start container with manager role
+          docker run -d \
+            --name ccc-manager \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            -v /opt/manager-daemon.py:/opt/manager-daemon.py:ro \
+            -e ROLE=manager \
+            -e MANAGER_NAME="${ManagerName}" \
+            -e MANAGER_TIER="${ManagerTier}" \
+            -e PARENT_URL="${ParentURL}" \
+            ${DockerImage} \
+            python3 /opt/manager-daemon.py
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref ManagerInstance
+
+  PublicIP:
+    Description: Public IP address
+    Value: !GetAtt ManagerInstance.PublicIp
+
+  PrivateIP:
+    Description: Private IP address
+    Value: !GetAtt ManagerInstance.PrivateIp
+
+  ManagerName:
+    Description: Manager node name
+    Value: !Ref ManagerName
+
+  Tier:
+    Description: Manager tier level
+    Value: !Ref ManagerTier
