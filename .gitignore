@@ -1,0 +1,30 @@
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+credentials/
+secrets/
+
+# Logs
+*.log
+logs/
+
+# Dependencies
+node_modules/
+
+# Archive
+archive/
+
+# Test results
+.test-results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
